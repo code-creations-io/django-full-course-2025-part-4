@@ -22,7 +22,7 @@ In this part, you’ll learn how to:
 - Optimise **query performance** with `select_related` / `prefetch_related`
 - Build **custom actions** for non‑CRUD operations
 - Handle **errors** and return consistent API responses
-- Add **tests** to validate behavior
+- **Testing** the views
 - Ship **OpenAPI** docs automatically
 
 > We’ll use the same data model from earlier parts: `Course`, `Module`, `Lesson`, `Enrollment`, `LessonProgress`, and `UserProfile`.
@@ -183,6 +183,24 @@ class ModuleViewSet(viewsets.ModelViewSet):
     search_fields = ["name", "slug", "description"]
     ordering_fields = ["order", "created_at", "updated_at"]
     ordering = ["order"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        # If this is a nested route: /api/courses/<course_pk>/modules/
+        course_pk = self.kwargs.get("course_pk")
+        if course_pk:
+            qs = qs.filter(course_id=course_pk)
+        return qs
+
+    def perform_create(self, serializer):
+        # If nested, bind the FK from the URL; otherwise allow explicit course in body (optional)
+        course_pk = self.kwargs.get("course_pk")
+        if course_pk:
+            course = get_object_or_404(Course, pk=course_pk)
+            serializer.save(course=course)
+        else:
+            # Non-nested POST to /api/modules/ can still work if course provided
+            serializer.save()
 ```
 
 ### LessonViewSet
@@ -197,12 +215,76 @@ class LessonViewSet(viewsets.ModelViewSet):
     ordering_fields = ["order", "created_at", "updated_at"]
     ordering = ["order"]
 
-    @action(detail=True, methods=["post"])
-    def mark_complete(self, request, pk=None):
-        """Custom action: mark a lesson as complete."""
-        lesson = self.get_object()
+    def get_queryset(self):
+        qs = super().get_queryset()
+        module_pk = self.kwargs.get("module_pk")
+        if module_pk:
+            qs = qs.filter(module_id=module_pk)
+        return qs
+
+    def perform_create(self, serializer):
+        module_pk = self.kwargs.get("module_pk")
+        if module_pk:
+            module = get_object_or_404(Module, pk=module_pk)
+            serializer.save(module=module)
+        else:
+            serializer.save()
+
+    @action(detail=True, methods=["post"], url_path="mark-complete")  # optional, for hyphen URL
+    def mark_complete(self, request, *args, **kwargs):
+        """
+        Custom action: mark a lesson as complete.
+        Accept *args, **kwargs so nested router's module_pk doesn't break the signature.
+        """
+        lesson = self.get_object()  # respects get_queryset() filtering w/ module_pk
+        # ⚠️ If LessonProgress.user is NOT nullable, don't pass user=None — it will 500.
+        # For a public API, either make user nullable or gate this behind auth.
         LessonProgress.objects.update_or_create(
-            user=None,  # anonymous since public
+            user=None,  # only works if FK allows nulls; otherwise replace with request.user
+            lesson=lesson,
+            defaults={"completed": True},
+        )
+        return Response({"status": "completed"})
+```
+
+### LessonProgressViewSet
+
+```python
+class LessonViewSet(viewsets.ModelViewSet):
+    queryset = Lesson.objects.select_related("module", "module__course")
+    serializer_class = LessonSerializer
+
+    filterset_fields = ["module", "module__course"]
+    search_fields = ["name", "slug", "content"]
+    ordering_fields = ["order", "created_at", "updated_at"]
+    ordering = ["order"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        module_pk = self.kwargs.get("module_pk")
+        if module_pk:
+            qs = qs.filter(module_id=module_pk)
+        return qs
+
+    def perform_create(self, serializer):
+        module_pk = self.kwargs.get("module_pk")
+        if module_pk:
+            module = get_object_or_404(Module, pk=module_pk)
+            serializer.save(module=module)
+        else:
+            serializer.save()
+
+    @action(detail=True, methods=["post"], url_path="mark-complete")  # optional, for hyphen URL
+    def mark_complete(self, request, *args, **kwargs):
+        """
+        Custom action: mark a lesson as complete.
+        Accept *args, **kwargs so nested router's module_pk doesn't break the signature.
+        """
+        lesson = self.get_object()  # respects get_queryset() filtering w/ module_pk
+        # ⚠️ If LessonProgress.user is NOT nullable, don't pass user=None — it will 500.
+        # For a public API, either make user nullable or gate this behind auth.
+        LessonProgress.objects.update_or_create(
+            user=None,  # only works if FK allows nulls; otherwise replace with request.user
             lesson=lesson,
             defaults={"completed": True},
         )
@@ -300,18 +382,14 @@ They let you create **semantic endpoints** like `/api/courses/<id>/publish/`, `/
 
 ---
 
-## 🧪 Tests (APITestCase / pytest)
+## Testing the Views
 
-```python
-from rest_framework.test import APITestCase
-from core.models import Course
-
-class CourseTests(APITestCase):
-    def test_list_courses(self):
-        Course.objects.create(name="Test", slug="test")
-        resp = self.client.get("/api/courses/")
-        self.assertEqual(resp.status_code, 200)
-```
+- `/api/courses/`: List or create all courses
+- `/api/courses/1/`: Retrieve or update a specific course
+- `/api/courses/1/modules/`: List all modules belonging to course 1
+- `/api/courses/1/modules/3/`: Get details of module 3 within course 1
+- `/api/modules/3/lessons/`: List all lessons in module 3
+- `/api/modules/3/lessons/7/`: Retrieve lesson 7 from module 3
 
 ---
 
